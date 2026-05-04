@@ -98,6 +98,18 @@ pub struct NetworkOpts {
     /// Sets the maximum size of a network messages.
     #[arg[long, default_value_t = DEFAULT_MESSAGE_SIZE_LIMIT, global = true, hide = true]]
     pub message_size_limit: NonZeroUsize,
+
+    /// Path to PEM-encoded CA certificate for verifying the server's TLS certificate.
+    #[arg(long, global = true, env = "RESTATECTL_TLS_CA")]
+    pub tls_ca: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded client certificate for mTLS authentication.
+    #[arg(long, global = true, env = "RESTATECTL_TLS_CERT", requires = "tls_key")]
+    pub tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded client private key for mTLS authentication.
+    #[arg(long, global = true, env = "RESTATECTL_TLS_KEY", requires = "tls_cert")]
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkOpts {
@@ -107,7 +119,16 @@ impl Default for NetworkOpts {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             insecure_skip_tls_verify: false,
             message_size_limit: DEFAULT_MESSAGE_SIZE_LIMIT,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         }
+    }
+}
+
+impl NetworkOpts {
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_ca.is_some() || self.tls_cert.is_some()
     }
 }
 

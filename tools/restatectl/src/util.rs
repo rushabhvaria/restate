@@ -11,19 +11,81 @@
 use std::{
     fmt::{self, Display},
     str::FromStr,
+    sync::Arc,
 };
+
+use rustls::pki_types::ServerName;
+use tokio::io;
+use tokio_rustls::TlsConnector;
 use tonic::transport::Channel;
 
 use restate_cli_util::CliContext;
 use restate_core::network::net_util::{DNSResolution, create_tonic_channel};
+use restate_core::network::tls::TlsCertResolver;
 use restate_types::{
+    config::FabricTlsOptions,
     logs::metadata::ProviderConfiguration,
-    net::address::{AdvertisedAddress, GrpcPort, ListenerPort},
+    net::address::{AdvertisedAddress, GrpcPort, ListenerPort, PeerNetAddress},
 };
 
 pub fn grpc_channel<P: ListenerPort + GrpcPort>(address: AdvertisedAddress<P>) -> Channel {
     let ctx = CliContext::get();
-    create_tonic_channel(address, &ctx.network, DNSResolution::Gai)
+
+    if ctx.network.tls_enabled() {
+        grpc_channel_with_tls(address, &ctx.network)
+    } else {
+        create_tonic_channel(address, &ctx.network, DNSResolution::Gai)
+    }
+}
+
+fn grpc_channel_with_tls<P: ListenerPort + GrpcPort>(
+    address: AdvertisedAddress<P>,
+    opts: &restate_cli_util::NetworkOpts,
+) -> Channel {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Endpoint;
+
+    let address = address.into_address().expect("valid address");
+    let PeerNetAddress::Http(uri) = &address else {
+        panic!("TLS is not supported for Unix domain sockets");
+    };
+
+    let endpoint = Endpoint::from(uri.clone())
+        .connect_timeout(std::time::Duration::from_millis(opts.connect_timeout))
+        .keep_alive_while_idle(true)
+        .tcp_nodelay(true);
+
+    let tls_opts = FabricTlsOptions {
+        mode: restate_types::config::TlsMode::Strict,
+        cert_file: opts.tls_cert.clone().unwrap_or_default(),
+        key_file: opts.tls_key.clone().unwrap_or_default(),
+        ca_files: opts.tls_ca.iter().cloned().collect(),
+        require_client_auth: false,
+        refresh_interval: restate_time_util::NonZeroFriendlyDuration::from_secs_unchecked(3600),
+        allowed_subject_names: vec![],
+        client: None,
+    };
+
+    let resolver =
+        TlsCertResolver::new(&tls_opts).expect("Failed to initialize TLS for restatectl");
+    let client_config = resolver.client_config();
+
+    let host = uri.host().unwrap_or("localhost").to_owned();
+    let port = uri.port_u16().unwrap_or(P::DEFAULT_PORT);
+
+    endpoint.connect_with_connector_lazy(tower::service_fn(move |_: http::Uri| {
+        let client_config = Arc::clone(&client_config);
+        let host = host.clone();
+        async move {
+            let tcp_stream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+            tcp_stream.set_nodelay(true)?;
+            let connector = TlsConnector::from(client_config);
+            let server_name = ServerName::try_from(host)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let tls_stream = connector.connect(server_name, tcp_stream).await?;
+            Ok::<_, io::Error>(TokioIo::new(tls_stream))
+        }
+    }))
 }
 
 pub fn write_default_provider<W: fmt::Write>(
